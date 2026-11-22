@@ -1,25 +1,24 @@
 #!/usr/bin/env python
 """
-Manual CARLA driving with automatic obstacle braking (AEB).
+Manual CARLA driving with Forward Collision Warning (FCW) and
+Automatic Emergency Braking (AEB) based on Time-to-Collision (TTC).
 
 Controls:
-    W            - throttle forward (blocked automatically if an obstacle is ahead)
-    S            - brake / reverse (always available - use this to back away from an obstacle)
+    W            - throttle
+    S            - brake (hold while stopped to reverse)
     A / D        - steer left / right
     SPACE        - handbrake
     ESC or Q     - quit
 
-Behavior:
-    - An obstacle sensor is mounted on the front of the car.
-    - If it detects something (car, pedestrian, wall, building, etc.) closer than
-      SAFE_DISTANCE while you are pressing W, the script overrides your input,
-      applies full brake, and sets throttle to 0.
-    - The car will NOT move forward again, even if you keep pressing W, until you
-      press S and reverse away until the obstacle is farther than SAFE_DISTANCE
-      (or no longer detected).
+Behavior (decision logic lives in aeb_logic.py):
+    TTC < 2.6 s  -> FCW: flashing warning on the HUD
+    TTC < 1.6 s  -> partial braking (40 %), throttle cut
+    TTC < 0.8 s  -> full braking, held until the car is at standstill
+TTC = distance / closing speed, using the speed of the object ahead.
 """
 
 import glob
+import math
 import os
 import sys
 import time
@@ -41,13 +40,34 @@ try:
 except ImportError:
     raise RuntimeError('cannot import pygame, make sure the pygame package is installed')
 
+from aeb_logic import AebController, AebState
+
 # --------------------------------------------------------------------------------------
 # Tunable parameters
 # --------------------------------------------------------------------------------------
-SAFE_DISTANCE = 8.0          # meters - if an obstacle is closer than this, auto-brake kicks in
+SENSOR_RANGE = 40.0          # meters - obstacle sensor detection range
+DETECTION_TIMEOUT = 0.3      # s - forget a detection if no new event arrives within this time
 WINDOW_WIDTH = 960
 WINDOW_HEIGHT = 540
 VEHICLE_BLUEPRINT = 'vehicle.tesla.model3'
+
+STATE_COLORS = {
+    AebState.NORMAL: (60, 255, 60),
+    AebState.FCW: (255, 200, 0),
+    AebState.PARTIAL_BRAKE: (255, 120, 0),
+    AebState.FULL_BRAKE: (255, 40, 40),
+}
+STATE_TEXT = {
+    AebState.NORMAL: 'OK - drive normally',
+    AebState.FCW: 'COLLISION WARNING!',
+    AebState.PARTIAL_BRAKE: 'AEB: PARTIAL BRAKING',
+    AebState.FULL_BRAKE: 'AEB: FULL BRAKING',
+}
+
+
+def speed_along(velocity, forward):
+    """Component of a velocity vector along a (unit) forward vector, in m/s."""
+    return velocity.x * forward.x + velocity.y * forward.y + velocity.z * forward.z
 
 
 class AutoBrakeVehicle:
@@ -60,7 +80,7 @@ class AutoBrakeVehicle:
         spawn_points = world.get_map().get_spawn_points()
         self.vehicle = world.spawn_actor(vehicle_bp, spawn_points[0])
 
-        # --- Attach an RGB camera so we can actually see while driving ---
+        # --- Chase camera ---
         camera_bp = self.blueprint_library.find('sensor.camera.rgb')
         camera_bp.set_attribute('image_size_x', str(WINDOW_WIDTH))
         camera_bp.set_attribute('image_size_y', str(WINDOW_HEIGHT))
@@ -69,55 +89,59 @@ class AutoBrakeVehicle:
         self.surface = None
         self.camera.listen(self._on_camera_image)
 
-        # --- Attach an obstacle detector facing forward ---
+        # --- Forward obstacle detector ---
         obstacle_bp = self.blueprint_library.find('sensor.other.obstacle')
-        obstacle_bp.set_attribute('distance', '20')       # max detection range (meters)
+        obstacle_bp.set_attribute('distance', str(SENSOR_RANGE))
         obstacle_bp.set_attribute('hit_radius', '0.5')
-        obstacle_bp.set_attribute('only_dynamics', 'false')  # detect static objects (buildings/walls) too
+        obstacle_bp.set_attribute('only_dynamics', 'false')  # also static objects (walls, buildings)
         obstacle_transform = carla.Transform(carla.Location(x=2.2, z=0.5))  # front bumper area
         self.obstacle_sensor = world.spawn_actor(obstacle_bp, obstacle_transform, attach_to=self.vehicle)
 
-        self.obstacle_distance = None      # None = nothing detected
+        self.obstacle_distance = None
+        self.obstacle_actor = None
         self.last_detection_time = 0.0
         self.obstacle_sensor.listen(self._on_obstacle)
 
-        # --- AEB state ---
-        self.blocked = False  # True = forward throttle is locked out until reverse clears it
+        # --- FCW / AEB ---
+        self.aeb = AebController()
+        self.ego_speed = 0.0
+        self.object_speed = 0.0
 
+    # ----------------------------------------------------------------- sensor callbacks
     def _on_camera_image(self, image):
         array = bytearray(image.raw_data)
-        surf = pygame.image.frombuffer(array, (image.width, image.height), 'BGRA')
-        self.surface = surf
+        self.surface = pygame.image.frombuffer(array, (image.width, image.height), 'BGRA')
 
     def _on_obstacle(self, event):
-        # event.distance = distance to the obstacle, event.other_actor = what was hit
         self.obstacle_distance = event.distance
+        self.obstacle_actor = event.other_actor
         self.last_detection_time = time.time()
 
     def _obstacle_is_fresh(self):
-        # obstacle events only fire on detection; treat detection as "stale" after a short window
-        # so that once the object leaves the sensor's path, we stop treating it as present.
-        return (time.time() - self.last_detection_time) < 0.3
+        return (time.time() - self.last_detection_time) < DETECTION_TIMEOUT
 
+    # ----------------------------------------------------------------- perception
+    def _measure(self):
+        """Return (distance or None, ego speed, object speed) along the ego heading."""
+        forward = self.vehicle.get_transform().get_forward_vector()
+        self.ego_speed = speed_along(self.vehicle.get_velocity(), forward)
+
+        if not self._obstacle_is_fresh() or self.obstacle_distance is None:
+            self.object_speed = 0.0
+            return None, self.ego_speed, 0.0
+
+        actor = self.obstacle_actor
+        try:
+            self.object_speed = speed_along(actor.get_velocity(), forward) if actor else 0.0
+        except RuntimeError:
+            self.object_speed = 0.0   # actor was destroyed meanwhile
+        return self.obstacle_distance, self.ego_speed, self.object_speed
+
+    # ----------------------------------------------------------------- control
     def get_control(self, keys):
         control = carla.VehicleControl()
 
-        throttle_requested = keys[K_w]
-        reverse_requested = keys[K_s]
-
-        obstacle_close = self._obstacle_is_fresh() and self.obstacle_distance is not None \
-            and self.obstacle_distance < SAFE_DISTANCE
-
-        # Enter blocked state whenever an obstacle is close and the driver is trying to go forward
-        if obstacle_close and throttle_requested and not reverse_requested:
-            self.blocked = True
-
-        # Clear the blocked state only once the driver has reversed far enough away
-        if self.blocked:
-            if not obstacle_close:
-                self.blocked = False
-
-        # --- Steering (always allowed) ---
+        # --- Driver request ---
         steer = 0.0
         if keys[K_a]:
             steer -= 0.5
@@ -126,25 +150,28 @@ class AutoBrakeVehicle:
         control.steer = steer
         control.hand_brake = keys[K_SPACE]
 
-        # --- Throttle / brake / reverse logic ---
-        if reverse_requested:
-            # Reversing is always allowed, even while "blocked" - this is how you clear the block
-            control.reverse = True
-            control.throttle = 0.6
-            control.brake = 0.0
-        elif self.blocked:
-            # AEB active: refuse to move forward no matter what, full brake
-            control.reverse = False
-            control.throttle = 0.0
-            control.brake = 1.0
-        elif throttle_requested:
-            control.reverse = False
-            control.throttle = 0.7
-            control.brake = 0.0
+        throttle, brake, reverse = 0.0, 0.0, False
+        if keys[K_s]:
+            if self.ego_speed > 0.5:
+                brake = 1.0                    # moving forward -> S brakes
+            else:
+                reverse, throttle = True, 0.6  # stopped -> S reverses
+        elif keys[K_w]:
+            throttle = 0.7
         else:
-            control.throttle = 0.0
-            control.brake = 0.3  # gentle coast-to-stop brake when no key pressed
+            brake = 0.3                        # gentle coast-to-stop
 
+        # --- FCW / AEB arbitration ---
+        distance, ego_speed, object_speed = self._measure()
+        state, aeb_brake = self.aeb.update(distance, max(ego_speed, 0.0), object_speed)
+
+        if aeb_brake > 0.0 and not reverse:
+            throttle = 0.0                     # AEB overrides the driver's throttle
+            brake = max(brake, aeb_brake)      # driver may always brake harder
+
+        control.throttle = throttle
+        control.brake = brake
+        control.reverse = reverse
         return control
 
     def destroy(self):
@@ -153,10 +180,36 @@ class AutoBrakeVehicle:
                 actor.destroy()
 
 
+def draw_hud(display, font, big_font, car):
+    state = car.aeb.state
+    color = STATE_COLORS[state]
+
+    # Flashing banner for warning / braking
+    if state != AebState.NORMAL and int(time.time() * 4) % 2 == 0:
+        banner = pygame.Surface((WINDOW_WIDTH, 50), pygame.SRCALPHA)
+        banner.fill((*color, 170))
+        display.blit(banner, (0, WINDOW_HEIGHT // 2 - 25))
+        text = big_font.render(STATE_TEXT[state], True, (255, 255, 255))
+        display.blit(text, text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2)))
+
+    ttc = car.aeb.ttc
+    lines = [
+        (STATE_TEXT[state], color),
+        ('Speed: %5.1f km/h' % (car.ego_speed * 3.6), (255, 255, 255)),
+        ('Obstacle: ' + ('%.1f m' % car.obstacle_distance
+                         if car._obstacle_is_fresh() and car.obstacle_distance is not None else '--'),
+         (255, 255, 255)),
+        ('Object speed: %5.1f km/h' % (car.object_speed * 3.6), (255, 255, 255)),
+        ('TTC: ' + ('--' if math.isinf(ttc) else '%.2f s' % ttc), color),
+    ]
+    for i, (txt, col) in enumerate(lines):
+        display.blit(font.render(txt, True, col), (10, 10 + 25 * i))
+
+
 def main():
     pygame.init()
     display = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption('CARLA - Manual Drive with Auto-Brake')
+    pygame.display.set_caption('CARLA - FCW / AEB (Time-to-Collision)')
     clock = pygame.time.Clock()
 
     client = carla.Client('localhost', 2000)
@@ -167,6 +220,7 @@ def main():
     try:
         car = AutoBrakeVehicle(world)
         font = pygame.font.SysFont('Arial', 20)
+        big_font = pygame.font.SysFont('Arial', 32, bold=True)
 
         running = True
         while running:
@@ -179,22 +233,11 @@ def main():
                     running = False
 
             keys = pygame.key.get_pressed()
-            control = car.get_control(keys)
-            car.vehicle.apply_control(control)
+            car.vehicle.apply_control(car.get_control(keys))
 
             if car.surface is not None:
                 display.blit(car.surface, (0, 0))
-
-            # --- HUD text ---
-            status_text = 'AUTO-BRAKE ACTIVE - reverse to clear' if car.blocked else 'OK - drive normally'
-            dist_text = f'Obstacle distance: {car.obstacle_distance:.1f} m' if (
-                car.obstacle_distance is not None and car._obstacle_is_fresh()) else 'Obstacle distance: -- '
-
-            status_surf = font.render(status_text, True, (255, 60, 60) if car.blocked else (60, 255, 60))
-            dist_surf = font.render(dist_text, True, (255, 255, 255))
-            display.blit(status_surf, (10, 10))
-            display.blit(dist_surf, (10, 35))
-
+            draw_hud(display, font, big_font, car)
             pygame.display.flip()
 
     finally:
