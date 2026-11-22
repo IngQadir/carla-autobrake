@@ -44,11 +44,11 @@ def compute_ttc(distance, ego_speed, object_speed=0.0, min_closing_speed=0.1):
     """
     if distance is None:
         return math.inf
-    if distance <= 0.0:
-        return 0.0
     closing_speed = ego_speed - object_speed
     if closing_speed <= min_closing_speed:
-        return math.inf
+        return math.inf          # not approaching -> no collision risk (also at standstill)
+    if distance <= 0.0:
+        return 0.0
     return distance / closing_speed
 
 

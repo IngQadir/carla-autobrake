@@ -46,10 +46,12 @@ from aeb_logic import AebController, AebState
 # Tunable parameters
 # --------------------------------------------------------------------------------------
 SENSOR_RANGE = 40.0          # meters - obstacle sensor detection range
+MIN_VALID_DISTANCE = 0.2     # m - readings below this are treated as sensor artefacts
 DETECTION_TIMEOUT = 0.3      # s - forget a detection if no new event arrives within this time
 WINDOW_WIDTH = 960
 WINDOW_HEIGHT = 540
 VEHICLE_BLUEPRINT = 'vehicle.tesla.model3'
+DEBUG = True                 # print every detected obstacle to the console
 
 STATE_COLORS = {
     AebState.NORMAL: (60, 255, 60),
@@ -75,6 +77,11 @@ class AutoBrakeVehicle:
         self.world = world
         self.blueprint_library = world.get_blueprint_library()
 
+        # --- FCW / AEB ---
+        self.aeb = AebController()
+        self.ego_speed = 0.0
+        self.object_speed = 0.0
+
         # --- Spawn the vehicle ---
         vehicle_bp = self.blueprint_library.filter(VEHICLE_BLUEPRINT)[0]
         spawn_points = world.get_map().get_spawn_points()
@@ -92,20 +99,20 @@ class AutoBrakeVehicle:
         # --- Forward obstacle detector ---
         obstacle_bp = self.blueprint_library.find('sensor.other.obstacle')
         obstacle_bp.set_attribute('distance', str(SENSOR_RANGE))
-        obstacle_bp.set_attribute('hit_radius', '0.5')
+        obstacle_bp.set_attribute('hit_radius', '0.3')
         obstacle_bp.set_attribute('only_dynamics', 'false')  # also static objects (walls, buildings)
-        obstacle_transform = carla.Transform(carla.Location(x=2.2, z=0.5))  # front bumper area
+        # Sensor just in front of the bumper and high enough that the sweep does not touch
+        # the car's own body or the road surface (otherwise it reports an obstacle at 0 m).
+        obstacle_transform = carla.Transform(carla.Location(x=2.6, z=1.0))
         self.obstacle_sensor = world.spawn_actor(obstacle_bp, obstacle_transform, attach_to=self.vehicle)
 
         self.obstacle_distance = None
         self.obstacle_actor = None
+        self.obstacle_type = ''
+        self._last_debug = 0.0
         self.last_detection_time = 0.0
         self.obstacle_sensor.listen(self._on_obstacle)
 
-        # --- FCW / AEB ---
-        self.aeb = AebController()
-        self.ego_speed = 0.0
-        self.object_speed = 0.0
 
     # ----------------------------------------------------------------- sensor callbacks
     def _on_camera_image(self, image):
@@ -113,9 +120,23 @@ class AutoBrakeVehicle:
         self.surface = pygame.image.frombuffer(array, (image.width, image.height), 'BGRA')
 
     def _on_obstacle(self, event):
+        # Ignore hits on our own car and implausible zero-distance readings
+        if event.other_actor is not None and event.other_actor.id == self.vehicle.id:
+            return
+        if event.distance < MIN_VALID_DISTANCE:
+            return
         self.obstacle_distance = event.distance
         self.obstacle_actor = event.other_actor
         self.last_detection_time = time.time()
+        try:
+            self.obstacle_type = event.other_actor.type_id
+        except Exception:
+            self.obstacle_type = '?'
+        if DEBUG and time.time() - self._last_debug > 0.5:
+            self._last_debug = time.time()
+            print('[obstacle] %-35s dist=%5.1f m  ego=%5.1f km/h  TTC=%s' % (
+                self.obstacle_type, event.distance, self.ego_speed * 3.6,
+                '--' if math.isinf(self.aeb.ttc) else '%.2f s' % self.aeb.ttc))
 
     def _obstacle_is_fresh(self):
         return (time.time() - self.last_detection_time) < DETECTION_TIMEOUT
@@ -199,6 +220,7 @@ def draw_hud(display, font, big_font, car):
         ('Obstacle: ' + ('%.1f m' % car.obstacle_distance
                          if car._obstacle_is_fresh() and car.obstacle_distance is not None else '--'),
          (255, 255, 255)),
+        ('Object: ' + (car.obstacle_type if car._obstacle_is_fresh() else '--'), (255, 255, 255)),
         ('Object speed: %5.1f km/h' % (car.object_speed * 3.6), (255, 255, 255)),
         ('TTC: ' + ('--' if math.isinf(ttc) else '%.2f s' % ttc), color),
     ]
