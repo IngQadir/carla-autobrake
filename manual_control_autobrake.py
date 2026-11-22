@@ -51,7 +51,7 @@ DETECTION_TIMEOUT = 0.3      # s - forget a detection if no new event arrives wi
 WINDOW_WIDTH = 960
 WINDOW_HEIGHT = 540
 VEHICLE_BLUEPRINT = 'vehicle.tesla.model3'
-DEBUG = True                 # print every detected obstacle to the console
+DEBUG = False                 # print every detected obstacle to the console
 
 STATE_COLORS = {
     AebState.NORMAL: (60, 255, 60),
