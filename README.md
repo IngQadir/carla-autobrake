@@ -9,7 +9,9 @@ A **Forward Collision Warning (FCW)** and **Automatic Emergency Braking (AEB)** 
 **Time-to-Collision (TTC)** with staged thresholds, running in the [CARLA](https://carla.org) driving simulator.
 You drive the car manually; the system warns you and brakes on its own if a collision becomes imminent.
 
-<!-- DEMO: drag your demo video or GIF into this line in the GitHub editor -->
+![FCW/AEB demo in CARLA: collision warning, partial braking, full braking](docs/demo.gif)
+
+*Driving on city roads in CARLA: collision warning, partial braking for a car ahead, and full emergency braking for a motorcycle, stopping 1.5 m before it.*
 
 ---
 
@@ -63,6 +65,7 @@ aeb_logic.py                  TTC calculation + FCW/AEB state machine (no CARLA 
 manual_control_autobrake.py   CARLA client: sensors, driver input, arbitration, HUD
 tests/test_aeb_logic.py       pytest unit tests (17 tests, 100 % coverage of aeb_logic.py)
 .github/workflows/tests.yml   CI: runs the tests on Python 3.10 / 3.11 / 3.12 on every push
+docs/demo.gif                 demo recording
 ```
 
 ## Running it
