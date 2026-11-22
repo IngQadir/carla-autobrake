@@ -36,6 +36,16 @@ def test_ttc_zero_distance_is_zero():
     assert compute_ttc(0.0, 10.0) == 0.0
 
 
+def test_ttc_zero_distance_at_standstill_is_infinite():
+    # regression: an obstacle reported at 0 m while the car is stopped must not lock the brakes
+    assert compute_ttc(0.0, 0.0) == math.inf
+
+
+def test_standstill_with_obstacle_at_zero_distance_releases_brake():
+    ctrl = AebController()
+    assert ctrl.update(0.0, 0.0) == (AebState.NORMAL, 0.0)
+
+
 # ---------------------------------------------------------------- stages
 
 @pytest.mark.parametrize("ttc, expected_state, expected_brake", [
